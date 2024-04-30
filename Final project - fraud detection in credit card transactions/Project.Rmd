@@ -1,0 +1,618 @@
+---
+title: "Project"
+author: 
+date: "2024-04-29"
+output: html_document
+---
+```{r}
+rm(list=ls())
+
+# Libraries
+library(ggplot2)
+library(readr)
+library(randomForest)
+library(isotree)
+library(MLmetrics)
+library(kernlab)
+library(dbscan)
+library(smotefamily)
+library(precrec)
+```
+
+
+Import the data in the same directory
+```{r}
+data = read_csv('creditcard.csv', show_col_types = FALSE)
+
+# Perform SMOTE to the data for later use
+smote_data = SMOTE(X = data[-31], target = data[31], dup_size = 20)
+smote_data = smote_data$data
+
+```
+
+
+Some EDA 
+
+```{r}
+dim(data)
+str(data)
+
+### EDA
+# Summary of the data
+head(data)
+summary(data)
+
+data$Class = as.factor(data$Class)
+smote_data$class = as.factor(smote_data$class)
+
+```
+
+
+Now we calculate the proportion of the variance in each component and plot it
+```{r}
+sum_var = 0
+for (i in 2:29) sum_var = sum_var + var(data[, i])
+
+PCA_var = matrix(0, 28, 1)
+for (i in 2:29) PCA_var[i-1] = var(data[, i]) / sum_var
+
+cumu_PCA = cumsum(PCA_var)
+x = 1:28
+df <- data.frame(x, PCA_var, cumu_PCA)
+ggplot(df)  +  
+  geom_bar(aes(x=x, y=PCA_var*100),stat="identity", fill="darkblue")+ 
+  geom_line(aes(x=x, y=cumu_PCA*100),stat="identity",color="red")+ 
+  labs(title= "Variance explained for each principal component", 
+       x="Principal component",y="Percentage of variance explained")+ 
+  scale_y_continuous(sec.axis=sec_axis(~.,name="Cumulative explained variance"))
+```
+
+Trying to visualise the anomalies using the two first principal components
+```{r}
+### Takes a bit of time to run and show the graph
+ggplot(data, aes(x = V1, y = V2, colour = Class)) + 
+  geom_point(alpha = 0.3) + theme_bw()+ 
+  labs(title= "First two principal components", 
+       x="First principal component",y="Second principal component")
+```
+
+
+
+```{r}
+# Percentage of fraudulent transactions in original data
+100*length(which(data$Class == 1))/length(data$Class)
+
+# Percentage of fraudulent transactions in SMOTE data
+100*length(which(smote_data$class == 1))/length(smote_data$class)
+```
+
+Now the train and test division
+
+```{r}
+#### Train and test
+# Division into train and test sets for target and features
+test_percentage = 0.2
+test_indices = sample(nrow(data), round(test_percentage * nrow(data)), replace = FALSE)
+
+# Test and train data division
+train = data[-test_indices, ]
+test = data[test_indices, ]
+
+# For SMOTE data
+smote_test_indices = sample(nrow(smote_data), round(test_percentage * nrow(smote_data)), replace = FALSE)
+smote_train = smote_data[-smote_test_indices, ]
+smote_test = smote_data[smote_test_indices, ]
+
+
+# Take out the class from train and test for unsupervised learning algorithms
+train_without_class = subset(train, select = -c(Class))
+test_without_class = subset(test, select = -c(Class))
+
+
+### Imbalance correction weighting
+# Re-weighting approach: The Inverse Class Frequency Method
+weight_0 = length(train$Class) / (2 * length(which(train$Class == 0)))
+weight_1 = length(train$Class) / (2 * length(which(train$Class == 1)))
+weights = ifelse(train$Class==1, weight_1, weight_0)
+```
+
+
+
+Supervised learning algorithms
+
+SMOTE Random forests
+
+```{r}
+set.seed(1)
+### Hyper-parameter tuning for SMOTE Random Forests using k-fold CV
+CV_k_RF_smote = function(data, k, ntree) {
+  data = data[sample(nrow(data), nrow(data), replace = FALSE), ]
+  folds = k
+  fold_assignments = rep(1:folds, length.out = nrow(data))
+  table(fold_assignments)
+  
+  fold_mses = c()
+  fold_recalls = c()
+  fold_AUC = c()
+  fold_prec = c()
+  for (i in 1:folds) {
+    #print(i)
+    val_indices = which(fold_assignments == i)
+    validation = data[val_indices, ]
+    train = data[-val_indices, ]
+    rf <- randomForest(x = train[-31], 
+                       y = train$class, 
+                       ntree = ntree)
+    
+    rf_prob <- predict(rf, validation[-31], type = 'prob')
+    rf_preds <- ifelse(rf_prob[,1] > 0.5, 0, 1)
+    acc = Accuracy(y_pred = rf_preds, y_true = validation$class)
+    recall = Recall(y_pred = rf_preds, y_true = validation$class, positive = '1')
+    prec = Precision(y_pred = rf_preds, y_true = validation$class, positive = '1')
+    auc = AUC(y_pred = rf_preds, y_true = validation$class)
+    
+    
+    fold_mses = c(fold_mses, (1 - acc))
+    fold_recalls = c(fold_recalls, recall)
+    fold_AUC = c(fold_AUC, auc)
+    fold_prec = c(fold_prec, prec)
+  }
+  cvMSE = mean(fold_mses)
+  cvRecall = mean(fold_recalls)
+  cvAUC = mean(fold_AUC)
+  cvprec = mean(fold_prec)
+  return(c(cvRecall, cvMSE, cvAUC, cvprec))
+}
+
+ntrees = c(1, 5, 10, 15, 20)
+k = 5
+metrics_ntrees = matrix(0, k, 4)
+for (i in 1:length(ntrees)){
+  #print(ntrees[i])
+  metrics_ntrees[i,] = CV_k_RF_smote(smote_train, k, ntrees[i])
+}
+
+# Metrics for each hyper-parameter in the order mean recall, mean MSE, mean AUC, mean precision
+metrics_ntrees
+
+# Best tree by highest recall
+best_ntree = ntrees[which.max(metrics_ntrees[, 1])]
+best_ntree
+# Best Random forests model
+random_forests_smote = randomForest(x = smote_train[-31], 
+                              y = smote_train$class, 
+                              ntree = best_ntree) 
+
+smote_rf_prob <- predict(random_forests_smote, smote_test, type = 'prob')
+smote_rf_preds <- ifelse(smote_rf_prob[,1] > 0.5, 0, 1)
+
+# Confusion matrix
+cf = ConfusionMatrix(y_pred = smote_rf_preds, y_true = smote_test$class)
+cf
+
+# Accuracy
+acc = Accuracy(y_pred = smote_rf_preds, y_true = smote_test$class)
+acc
+
+# Recall
+recall = Recall(y_pred = smote_rf_preds, y_true = smote_test$class, positive = '1')
+recall
+
+# Specificity
+spec = Specificity(y_pred = smote_rf_preds, y_true = smote_test$class, positive = '1')
+spec
+
+# Precision
+prec = Precision(y_pred = smote_rf_preds, y_true = smote_test$class, positive = '1')
+prec
+
+# AUC
+auc = AUC(y_pred = smote_rf_preds, y_true = smote_test$class)
+auc
+
+# Plot
+precrec_obj <- evalmod(scores = smote_rf_prob[, 2], labels = smote_test$class)
+autoplot(precrec_obj)
+```
+
+
+
+Weighted Random forests
+
+```{r}
+set.seed(1)
+### Hyper-parameter tuning for Weighted Random Forests using k-fold CV
+CV_k_RF = function(data, k, ntree) {
+  data = data[sample(nrow(data), nrow(data), replace = FALSE), ]
+  folds = k
+  fold_assignments = rep(1:folds, length.out = nrow(data))
+  table(fold_assignments)
+  fold_mses = c()
+  fold_recalls = c()
+  fold_AUC = c()
+  fold_prec = c()
+  for (i in 1:folds) {
+    #print(i)
+    val_indices = which(fold_assignments == i)
+    validation = data[val_indices, ]
+    train = data[-val_indices, ]
+    weight_0 = length(train$Class) / (2 * length(which(train$Class == 0)))
+    weight_1 = length(train$Class) / (2 * length(which(train$Class == 1)))
+    weights = ifelse(train$Class==1, weight_1, weight_0)
+    rf <- randomForest(x = train[-31], 
+                       y = train$Class, 
+                       ntree = ntree,
+                       weights = weights)
+    
+    rf_prob <- predict(rf, validation[-31], type = 'prob')
+    rf_preds <- ifelse(rf_prob[,1] > 0.5, 0, 1)
+    acc = Accuracy(y_pred = rf_preds, y_true = validation$Class)
+    recall = Recall(y_pred = rf_preds, y_true = validation$Class, positive = '1')
+    prec = Precision(y_pred = rf_preds, y_true = validation$Class, positive = '1')
+    auc = AUC(y_pred = rf_preds, y_true = validation$Class)
+    
+    
+    fold_mses = c(fold_mses, (1 - acc))
+    fold_recalls = c(fold_recalls, recall)
+    fold_AUC = c(fold_AUC, auc)
+    fold_prec = c(fold_prec, prec)
+  }
+  cvMSE = mean(fold_mses)
+  cvRecall = mean(fold_recalls)
+  cvAUC = mean(fold_AUC)
+  cvprec = mean(fold_prec)
+  return(c(cvRecall, cvMSE, cvAUC, cvprec))
+}
+
+ntrees = c(1, 5, 10, 20, 30)
+k = 5
+metrics_ntrees = matrix(0, k, 4)
+for (i in 1:length(ntrees)){
+  #print(ntrees[i])
+  metrics_ntrees[i,] = CV_k_RF(train, k, ntrees[i])
+}
+
+# Metrics for each hyper-parameter in the order mean recall, mean MSE, mean AUC, mean precision
+metrics_ntrees
+
+# Best tree by highest recall
+best_ntree = ntrees[which.max(metrics_ntrees[, 1])]
+best_ntree
+# Best Random forests model
+random_forests = randomForest(Class ~., train, 
+                              ntree = best_ntree, 
+                              mtry = 10, 
+                              weights = weights)
+
+
+rf_prob = predict(random_forests, test, type = 'prob')
+rf_preds = ifelse(rf_prob[,1] > 0.5, 0, 1)
+
+# Confusion matrix
+cf = ConfusionMatrix(y_pred = rf_preds, y_true = test$Class)
+cf
+
+# Accuracy
+acc = Accuracy(y_pred = rf_preds, y_true = test$Class)
+acc
+
+# Recall
+recall = Recall(y_pred = rf_preds, y_true = test$Class, positive = '1')
+recall
+
+# Specificity
+spec = Specificity(y_pred = rf_preds, y_true = test$Class, positive = '1')
+spec
+
+# Precision
+prec = Precision(y_pred = rf_preds, y_true = test$Class, positive = '1')
+prec
+
+#AUC
+auc = AUC(y_pred = rf_preds, y_true = test$Class)
+auc
+
+# Plot
+precrec_obj <- evalmod(scores = rf_prob[, 2], labels = test$Class)
+autoplot(precrec_obj)
+```
+
+Anomaly detection models: unsupervised learning
+
+```{r}
+set.seed(1)
+### Hyper-parameter tuning for Isolation Forests using k-fold CV
+CV_k_IF1 = function(data, k, ntree) {
+  data = data[sample(nrow(data), nrow(data), replace = FALSE), ]
+  folds = k
+  fold_assignments = rep(1:folds, length.out = nrow(data))
+  table(fold_assignments)
+  fold_mses = c()
+  fold_recalls = c()
+  fold_AUC = c()
+  fold_prec = c()
+  for (i in 1:folds) {
+    #print(i)
+    val_indices = which(fold_assignments == i)
+    validation = data[val_indices, ]
+    train = data[-val_indices, ]
+    train_without_class = subset(train, select = -c(Class))
+    IF1 <- isolation.forest(
+                train_without_class,
+                ndim=1, sample_size=100,
+                ntrees=ntree,
+                missing_action="fail"
+              )
+    val_without_class = subset(validation, select = -c(Class))
+    IF1_prob <- predict(IF1, val_without_class, type = 'score')
+    IF1_preds <- ifelse(IF1_prob < 0.5, 0, 1)
+
+    acc = Accuracy(y_pred = IF1_preds, y_true = validation$Class)
+    recall = Recall(y_pred = IF1_preds, y_true = validation$Class, positive = '1')
+    prec = Precision(y_pred = IF1_preds, y_true = validation$Class, positive = '1')
+    auc = AUC(y_pred = IF1_prob, y_true = validation$Class)
+    
+    fold_mses = c(fold_mses, (1 - acc))
+    fold_recalls = c(fold_recalls, recall)
+    fold_AUC = c(fold_AUC, auc)
+    fold_prec = c(fold_prec, prec)
+  }
+  cvMSE = mean(fold_mses)
+  cvRecall = mean(fold_recalls)
+  cvAUC = mean(fold_AUC)
+  cvprec = mean(fold_prec)
+  return(c(cvRecall, cvMSE, cvAUC, cvprec))
+}
+
+ntrees1 = c(1, 10, 20, 50, 100)
+k = 5
+metrics_ntrees1 = matrix(0, k, 4)
+for (i in 1:length(ntrees1)){
+  #print(ntrees1[i])
+  metrics_ntrees1[i,] = CV_k_IF1(train, k, ntrees1[i])
+}
+
+# Metrics for each hyper-parameter in the order mean recall, mean MSE, mean AUC, mean precision
+metrics_ntrees1
+
+# Best tree by highest recall
+best_ntree1 = ntrees1[which.max(metrics_ntrees1[, 1])]
+best_ntree1
+
+iso_forests1 <- isolation.forest(
+  train_without_class,
+  ndim=1, sample_size=100,
+  ntrees=best_ntree1,
+  missing_action="fail"
+)
+
+iso_score1 <- predict(iso_forests1, test_without_class, type = 'score')
+iso_preds1 <- ifelse(iso_score1 < 0.5, 0, 1)
+
+# Confusion matrix
+cf = ConfusionMatrix(y_pred = iso_preds1, y_true = test$Class)
+cf
+
+# Accuracy
+acc = Accuracy(y_pred = iso_preds1, y_true = test$Class)
+acc
+
+# Recall
+recall = Recall(y_pred = iso_preds1, y_true = test$Class, positive = '1')
+recall
+
+# Specificity
+spec = Specificity(y_pred = iso_preds1, y_true = test$Class, positive = '1')
+spec
+
+# Precision
+prec = Precision(y_pred = iso_preds1, y_true = test$Class, positive = '1')
+prec
+
+# AUC
+auc = AUC(y_pred = iso_score1, y_true = test$Class)
+auc
+
+# Plot
+precrec_obj <- evalmod(scores = iso_score1, labels = test$Class)
+autoplot(precrec_obj)
+```
+
+
+Fair-Cut Forests
+
+```{r}
+set.seed(1)
+### Hyper-parameter tuning for Fair-Cut Forest using k-fold CV
+CV_k_IF2 = function(data, k, ntree) {
+  data = data[sample(nrow(data), nrow(data), replace = FALSE), ]
+  folds = k
+  fold_assignments = rep(1:folds, length.out = nrow(data))
+  table(fold_assignments)
+  fold_mses = c()
+  fold_recalls = c()
+  fold_AUC = c()
+  fold_prec = c()
+  for (i in 1:folds) {
+    #print(i)
+    val_indices = which(fold_assignments == i)
+    validation = data[val_indices, ]
+    train = data[-val_indices, ]
+    train_without_class = subset(train, select = -c(Class))
+    weight_0 = length(train$Class) / (2 * length(which(train$Class == 0)))
+    weight_1 = length(train$Class) / (2 * length(which(train$Class == 1)))
+    weights = ifelse(train$Class==1, weight_1, weight_0)
+    IF2 <- isolation.forest(
+      train_without_class,
+      ndim=1, sample_size=500,
+      ntrees=ntree,
+      missing_action="fail",
+      prob_pick_pooled_gain=1,
+      sample_weights = weights
+    )
+    val_without_class = subset(validation, select = -c(Class))
+    IF2_prob <- predict(IF2, val_without_class, type = 'score')
+    IF2_preds <- ifelse(IF2_prob < 0.5, 0, 1)
+    
+    acc = Accuracy(y_pred = IF2_preds, y_true = validation$Class)
+    recall = Recall(y_pred = IF2_preds, y_true = validation$Class, positive = '1')
+    prec = Precision(y_pred = IF2_preds, y_true = validation$Class, positive = '1')
+    auc = AUC(y_pred = IF2_prob, y_true = validation$Class)
+    
+    fold_mses = c(fold_mses, (1 - acc))
+    fold_recalls = c(fold_recalls, recall)
+    fold_AUC = c(fold_AUC, auc)
+    fold_prec = c(fold_prec, prec)
+  }
+  cvMSE = mean(fold_mses)
+  cvRecall = mean(fold_recalls)
+  cvAUC = mean(fold_AUC)
+  cvprec = mean(fold_prec)
+  return(c(cvRecall, cvMSE, cvAUC, cvprec))
+}
+
+ntrees2 = c(1, 10, 20, 50, 100)
+k = 5
+metrics_ntrees2 = matrix(0, k, 4)
+for (i in 1:length(ntrees2)){
+  #print(ntrees2[i])
+  metrics_ntrees2[i,] = CV_k_IF2(train, k, ntrees2[i])
+}
+
+# Metrics for each hyper-parameter in the order mean recall, mean MSE, mean AUC, mean precision
+metrics_ntrees2
+
+# Best tree by highest recall
+best_ntree2 = ntrees2[which.max(metrics_ntrees2[, 1])]
+best_ntree2
+
+# Isolation forests variant 2
+iso_forests2 <- isolation.forest(
+  train_without_class,
+  ndim=1, sample_size=500,
+  ntrees=best_ntree2,
+  missing_action="fail",
+  prob_pick_pooled_gain=1,
+  sample_weights = weights
+)
+
+iso_score2 <- predict(iso_forests2, test_without_class, type = 'score')
+iso_preds2 <- ifelse(iso_score2 < 0.5, 0, 1)
+
+# Confusion matrix
+cf = ConfusionMatrix(y_pred = iso_preds2, y_true = test$Class)
+cf
+
+# Accuracy
+acc = Accuracy(y_pred = iso_preds2, y_true = test$Class)
+acc
+
+# Recall
+recall = Recall(y_pred = iso_preds2, y_true = test$Class, positive = '1')
+recall
+
+# Specificity
+spec = Specificity(y_pred = iso_preds2, y_true = test$Class, positive = '1')
+spec
+
+# Precision
+prec = Precision(y_pred = iso_preds2, y_true = test$Class, positive = '1')
+prec
+
+# AUC
+auc = AUC(y_pred = iso_score2, y_true = test$Class)
+auc
+
+# Plot
+precrec_obj <- evalmod(scores = iso_score2, labels = test$Class)
+autoplot(precrec_obj)
+```
+
+
+DBSCAN classifier
+```{r}
+set.seed(1)
+### Hyper-parameter tuning for Fair-Cut Forest using k-fold CV
+CV_k_db = function(data, k, eps) {
+  data = data[sample(nrow(data), nrow(data), replace = FALSE), ]
+  folds = k
+  fold_assignments = rep(1:folds, length.out = nrow(data))
+  table(fold_assignments)
+  fold_recalls = c()
+  fold_prec = c()
+  
+
+  for (i in 1:folds) {
+    print(i)
+    val_indices = which(fold_assignments == i)
+    validation = data[val_indices, ]
+    train = data[-val_indices, ]
+
+    train_data <- train[, c("V1", "V2", "V3", "V4", "V5")]
+    val_data <- validation[, c("V1", "V2", "V3", "V4", "V5")]
+    
+    train_scaled <- scale(train_data)
+    val_scaled <- scale(val_data, 
+                         center=attr(train_scaled, "scaled:center"), 
+                         scale=attr(train_scaled, "scaled:scale"))    
+    
+    
+    db_result <- dbscan(train_scaled, eps = eps, minPts = 5)
+    dbscan_pred <- predict(db_result, newdata = val_scaled, data = train_scaled)
+    dbscan_preds = ifelse(dbscan_pred == 0, 1, 0)
+
+    recall = Recall(y_pred = dbscan_preds, y_true = validation$Class, positive = '1')
+    prec = Precision(y_pred = dbscan_preds, y_true = validation$Class, positive = '1')
+
+    fold_recalls = c(fold_recalls, recall)
+    fold_prec = c(fold_prec, prec)
+  }
+  cvRecall = mean(fold_recalls)
+  cvprec = mean(fold_prec)
+  return(c(cvRecall, cvprec))
+}
+
+n_eps = c(0.05, 0.1, 0.25)
+k = 5
+metrics_n_eps = matrix(0, k, 2)
+for (i in 1:length(n_eps)){
+  print(n_eps[i])
+  metrics_n_eps[i,] = CV_k_db(train, k, n_eps[i])
+}
+
+metrics_n_eps
+best_eps = n_eps[which.max(metrics_n_eps[, 1])]
+best_eps
+
+
+train_data <- train[, c("V1", "V2", "V3", "V4", "V5")]
+test_data <- test[, c("V1", "V2", "V3", "V4", "V5")]
+
+train_scaled <- scale(train_data)
+test_scaled <- scale(test_data, 
+                     center=attr(train_scaled, "scaled:center"), 
+                     scale=attr(train_scaled, "scaled:scale"))
+
+
+db_result <- dbscan(train_scaled, eps = best_eps, minPts = 5)
+dbscan_pred <- predict(db_result, newdata = test_scaled, data = train_scaled)
+dbscan_preds = ifelse(dbscan_pred == 0, 1, 0)
+
+
+
+# Accuracy
+acc = Accuracy(y_pred = dbscan_preds, y_true = test$Class)
+acc
+
+# Recall
+recall = Recall(y_pred = dbscan_preds, y_true = test$Class, positive = '1')
+recall
+
+# Specificity
+spec = Specificity(y_pred = dbscan_preds, y_true = test$Class, positive = '1')
+spec
+
+# Precision
+prec = Precision(y_pred = dbscan_preds, y_true = test$Class, positive = '1')
+prec
+```
